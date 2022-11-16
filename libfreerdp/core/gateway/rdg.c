@@ -1762,6 +1762,7 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 	if (!rdg_tls_connect(rdg, tls, peerAddress, timeout))
 		return FALSE;
 
+	WINPR_ASSERT(rpcFallback);
 	if (rdg->extAuth == HTTP_EXTENDED_AUTH_NONE)
 	{
 		if (!rdg_auth_init(rdg, tls))
@@ -1771,9 +1772,14 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 			return FALSE;
 
 		response = http_response_recv(tls, TRUE);
-
+		/* MS RD Gateway seems to just terminate the tls connection without
+		 * sending an answer if it is not happy with the http request */
 		if (!response)
+		{
+			WLog_INFO(TAG, "RD Gateway HTTP transport broken.");
+			*rpcFallback = TRUE;
 			return FALSE;
+		}
 
 		StatusCode = http_response_get_status_code(response);
 
@@ -1782,10 +1788,7 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 			case HTTP_STATUS_NOT_FOUND:
 			{
 				WLog_INFO(TAG, "RD Gateway does not support HTTP transport.");
-				http_context_enable_websocket_upgrade(rdg->http, FALSE);
-
-				if (rpcFallback)
-					*rpcFallback = TRUE;
+				*rpcFallback = TRUE;
 
 				http_response_free(response);
 				return FALSE;
@@ -1811,7 +1814,11 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 
 				response = http_response_recv(tls, TRUE);
 				if (!response)
+				{
+					WLog_INFO(TAG, "RD Gateway HTTP transport broken.");
+					*rpcFallback = TRUE;
 					return FALSE;
+				}
 			}
 		}
 		credssp_auth_free(rdg->auth);
@@ -1828,7 +1835,11 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 		response = http_response_recv(tls, TRUE);
 
 		if (!response)
+		{
+			WLog_INFO(TAG, "RD Gateway HTTP transport broken.");
+			*rpcFallback = TRUE;
 			return FALSE;
+		}
 	}
 
 	statusCode = http_response_get_status_code(response);
@@ -1933,9 +1944,11 @@ BOOL rdg_connect(rdpRdg* rdg, DWORD timeout, BOOL* rpcFallback)
 	BOOL status;
 	SOCKET outConnSocket = 0;
 	char* peerAddress = NULL;
+	BOOL rpcFallbackLocal = FALSE;
+
 	WINPR_ASSERT(rdg != NULL);
-	status =
-	    rdg_establish_data_connection(rdg, rdg->tlsOut, "RDG_OUT_DATA", NULL, timeout, rpcFallback);
+	status = rdg_establish_data_connection(rdg, rdg->tlsOut, "RDG_OUT_DATA", NULL, timeout,
+	                                       &rpcFallbackLocal);
 
 	if (status)
 	{
@@ -1951,16 +1964,26 @@ BOOL rdg_connect(rdpRdg* rdg, DWORD timeout, BOOL* rpcFallback)
 			BIO_get_socket(rdg->tlsOut->underlying, &outConnSocket);
 			peerAddress = freerdp_tcp_get_peer_address(outConnSocket);
 			status = rdg_establish_data_connection(rdg, rdg->tlsIn, "RDG_IN_DATA", peerAddress,
-			                                       timeout, NULL);
+			                                       timeout, &rpcFallbackLocal);
 			free(peerAddress);
 		}
 	}
+
+	if (rpcFallback)
+		*rpcFallback = rpcFallbackLocal;
 
 	if (!status)
 	{
 		WINPR_ASSERT(rdg);
 		WINPR_ASSERT(rdg->context);
 		WINPR_ASSERT(rdg->context->rdp);
+		if (rpcFallbackLocal)
+		{
+			http_context_enable_websocket_upgrade(rdg->http, FALSE);
+			credssp_auth_free(rdg->auth);
+			rdg->auth = NULL;
+		}
+
 		transport_set_layer(rdg->context->rdp->transport, TRANSPORT_LAYER_CLOSED);
 		return FALSE;
 	}
